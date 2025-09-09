@@ -1,0 +1,221 @@
+name: 'Parse Koala Config'
+description: 'Parse koala.yaml/json configuration file for services, environments, and build/deploy settings'
+
+inputs:
+  environment:
+    description: 'Target environment (optional, for environment-specific resolution)'
+    required: false
+  tag_base:
+    description: 'Base tag for services (optional, for tag generation)'
+    required: false
+  config_path:
+    description: 'Explicit path to config file (optional, auto-detects if not provided)'
+    required: false
+
+outputs:
+  version:
+    description: 'Config schema version'
+    value: ${{ steps.parse.outputs.version }}
+  services_matrix:
+    description: 'GitHub Actions matrix format with resolved service configurations'
+    value: ${{ steps.parse.outputs.services_matrix }}
+  services_list:
+    description: 'Simple list of service names'
+    value: ${{ steps.parse.outputs.services_list }}
+  env_clusters:
+    description: 'Environment to cluster mapping'
+    value: ${{ steps.parse.outputs.env_clusters }}
+  has_multiple_services:
+    description: 'Whether this is a multi-service configuration'
+    value: ${{ steps.parse.outputs.has_multiple_services }}
+  service_count:
+    description: 'Number of services defined'
+    value: ${{ steps.parse.outputs.service_count }}
+  config_format:
+    description: 'Format of the config file (yaml/json)'
+    value: ${{ steps.parse.outputs.config_format }}
+
+runs:
+  using: composite
+  steps:
+    - name: Parse Koala Config
+      id: parse
+      shell: bash
+      run: |
+        # Function to find config file
+        find_config_file() {
+          # Priority order: explicit path > root files > .koala directory
+          if [ -n "${{ inputs.config_path }}" ]; then
+            if [ -f "${{ inputs.config_path }}" ]; then
+              echo "${{ inputs.config_path }}"
+              return 0
+            fi
+            echo "::error::Specified config file not found: ${{ inputs.config_path }}"
+            exit 1
+          fi
+          
+          # Check root directory (in order of preference)
+          for file in koala.yaml koala.yml koala.json; do
+            if [ -f "$file" ]; then
+              echo "$file"
+              return 0
+            fi
+          done
+          
+          return 1
+        }
+        
+        # Function to detect format
+        detect_format() {
+          local file=$1
+          case "$file" in
+            *.yaml|*.yml) echo "yaml" ;;
+            *.json) echo "json" ;;
+            *) echo "unknown" ;;
+          esac
+        }
+        
+        # Find the config file
+        CONFIG_FILE=$(find_config_file)
+        
+        if [ -z "$CONFIG_FILE" ]; then
+          echo "::notice::No koala config file found, assuming single-service repository"
+          
+          # Generate single-service config
+          SERVICE_NAME="${GITHUB_REPOSITORY##*/}"  # Use repo name as service name
+          
+          # Create minimal single-service output
+          SERVICES_MATRIX='{"include":[{"service_name":"'$SERVICE_NAME'","service_dir":"."}]}'
+          
+          echo "version=1" >> $GITHUB_OUTPUT
+          echo "services_matrix=$SERVICES_MATRIX" >> $GITHUB_OUTPUT
+          echo "services_list=$SERVICE_NAME" >> $GITHUB_OUTPUT
+          echo "env_clusters={}" >> $GITHUB_OUTPUT
+          echo "has_multiple_services=false" >> $GITHUB_OUTPUT
+          echo "service_count=1" >> $GITHUB_OUTPUT
+          echo "config_format=none" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        
+        echo "Found config file: $CONFIG_FILE"
+        FORMAT=$(detect_format "$CONFIG_FILE")
+        echo "config_format=$FORMAT" >> $GITHUB_OUTPUT
+        
+        # Parse the config file
+        if [ "$FORMAT" == "yaml" ]; then
+          # Check if yq is available, otherwise use python
+          if command -v yq &> /dev/null; then
+            CONFIG_JSON=$(yq -o json "$CONFIG_FILE")
+          elif command -v python3 &> /dev/null; then
+            CONFIG_JSON=$(python3 -c "import yaml, json, sys; print(json.dumps(yaml.safe_load(open('$CONFIG_FILE'))))")
+          else
+            echo "::error::YAML parsing requires yq or python3 with PyYAML"
+            exit 1
+          fi
+        else
+          CONFIG_JSON=$(cat "$CONFIG_FILE")
+        fi
+        
+        # Validate JSON
+        echo "$CONFIG_JSON" | jq empty || {
+          echo "::error::Invalid configuration file format"
+          exit 1
+        }
+        
+        # Extract version
+        VERSION=$(echo "$CONFIG_JSON" | jq -r '.version // "1"')
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        
+        # Extract environment clusters
+        ENV_CLUSTERS=$(echo "$CONFIG_JSON" | jq -c '.environments // {}')
+        echo "env_clusters=$ENV_CLUSTERS" >> $GITHUB_OUTPUT
+        
+        # Get target environment's cluster if specified
+        if [ -n "${{ inputs.environment }}" ]; then
+          TARGET_CLUSTER=$(echo "$ENV_CLUSTERS" | jq -r --arg env "${{ inputs.environment }}" '.[$env].cluster // empty')
+        fi
+        
+        # Parse services (object format only)
+        SERVICES=$(echo "$CONFIG_JSON" | jq -c '.services // {}')
+        SERVICE_COUNT=$(echo "$SERVICES" | jq 'keys | length')
+        SERVICES_LIST=$(echo "$SERVICES" | jq -r 'keys | join(",")')
+        
+        echo "services_list=$SERVICES_LIST" >> $GITHUB_OUTPUT
+        echo "service_count=$SERVICE_COUNT" >> $GITHUB_OUTPUT
+        
+        if [ "$SERVICE_COUNT" -gt 1 ]; then
+          echo "has_multiple_services=true" >> $GITHUB_OUTPUT
+        else
+          echo "has_multiple_services=false" >> $GITHUB_OUTPUT
+        fi
+        
+        # Build services matrix
+        MATRIX_JSON="[]"
+        COUNTER=0
+        
+        # Process services (object format only)
+        for service_name in $(echo "$SERVICES" | jq -r 'keys[]'); do
+            SERVICE=$(echo "$SERVICES" | jq --arg name "$service_name" '.[$name]')
+            SERVICE_DIR=$(echo "$SERVICE" | jq -r '.dir // "."')
+            
+            # Generate service tag
+            if [ -n "${{ inputs.tag_base }}" ]; then
+              if [ "$SERVICE_COUNT" -gt 1 ]; then
+                SERVICE_TAG="${{ inputs.tag_base }}-${COUNTER}"
+              else
+                SERVICE_TAG="${{ inputs.tag_base }}"
+              fi
+            else
+              SERVICE_TAG=""
+            fi
+            
+            # Build matrix entry
+            DEPLOY_REPO=$(echo "$SERVICE" | jq -r '.deployment_repo // "self"')
+            DEPLOY_PATH=$(echo "$SERVICE" | jq -r '.deployment_path // ""')
+            
+            MATRIX_ENTRY=$(jq -n \
+              --arg name "$service_name" \
+              --arg dir "$SERVICE_DIR" \
+              --arg tag "$SERVICE_TAG" \
+              --arg deploy_repo "$DEPLOY_REPO" \
+              --arg deploy_path "$DEPLOY_PATH" \
+              '{
+                service_name: $name,
+                service_dir: $dir,
+                service_tag: $tag,
+                deployment_repo: $deploy_repo,
+                deployment_path: $deploy_path
+              }')
+            
+            # Apply environment-specific overrides
+            if [ -n "${{ inputs.environment }}" ]; then
+              ENV_CONFIG=$(echo "$SERVICE" | jq --arg env "${{ inputs.environment }}" '.env[$env] // empty')
+              if [ -n "$ENV_CONFIG" ] && [ "$ENV_CONFIG" != "null" ]; then
+                # No deployment_repo/path overrides per environment - they're at service level only
+                ENV_CLUSTER=$(echo "$ENV_CONFIG" | jq -r '.cluster // empty')
+                if [ -n "$ENV_CLUSTER" ]; then
+                  MATRIX_ENTRY=$(echo "$MATRIX_ENTRY" | jq --arg cluster "$ENV_CLUSTER" '.cluster = $cluster')
+                fi
+              fi
+              
+              # Add global environment cluster if not overridden
+              if [ -n "$TARGET_CLUSTER" ]; then
+                CURRENT_CLUSTER=$(echo "$MATRIX_ENTRY" | jq -r '.cluster // empty')
+                if [ -z "$CURRENT_CLUSTER" ]; then
+                  MATRIX_ENTRY=$(echo "$MATRIX_ENTRY" | jq --arg cluster "$TARGET_CLUSTER" '.cluster = $cluster')
+                fi
+              fi
+            fi
+            
+          MATRIX_JSON=$(echo "$MATRIX_JSON" | jq ". += [$MATRIX_ENTRY]")
+          COUNTER=$((COUNTER + 1))
+        done
+        
+        # Output matrix in GitHub Actions format
+        echo "services_matrix={\"include\":$MATRIX_JSON}" >> $GITHUB_OUTPUT
+        
+        # Display summary
+        echo "✅ Parsed config:"
+        echo "  - Version: $VERSION"
+        echo "  - Services: $SERVICE_COUNT"
+        echo "  - Format: $FORMAT"
