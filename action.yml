@@ -1,5 +1,5 @@
 name: 'Parse Koala Config'
-description: 'Parse koala.yaml/json configuration file for services, environments, and build/deploy settings'
+description: '⚠️ WIP - NOT IN USE. Parse koala.yaml/json configuration file for services, environments, and build/deploy settings'
 author: 'KoalaOps'
 
 branding:
