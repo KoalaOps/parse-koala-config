@@ -1,5 +1,9 @@
 # Parse Koala Config
 
+> **⚠️ WORK IN PROGRESS - NOT CURRENTLY IN USE**
+>
+> This action is under development and is not yet being used in production. The API and functionality may change without notice.
+
 **Internal Action** - Parses KoalaOps configuration files for workflow generation.
 
 ## Purpose
